@@ -63,3 +63,7 @@ Variáveis de ambiente lidas pelo `pinlock-helper`:
 
 Uma pasta bloqueada também pode ser aberta manualmente, sem a extensão:
 `gocryptfs Fotos /algum/ponto/de/montagem`.
+
+## Licença
+
+[MIT](LICENSE) © 2026 Sergio Lisan
