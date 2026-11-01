@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""PinLock — protege pastas com um PIN numérico usando gocryptfs.
+
+A pasta mantém sempre o mesmo nome:
+
+    Bloqueada:    Fotos/            -> é o próprio cofre cifrado (aparece vazia,
+                                       somente leitura e com ícone de cadeado)
+    Desbloqueada: .Fotos.pinlock/   -> cofre cifrado, renomeado e oculto
+                  Fotos/            -> visão decifrada (montagem gocryptfs)
+
+Uso:
+    pinlock-helper protect <pasta>   # cifra a pasta (pede PIN novo)
+    pinlock-helper unlock  <pasta>   # pede o PIN e desbloqueia
+    pinlock-helper lock    <pasta>   # bloqueia
+    pinlock-helper remove  <pasta>   # remove a proteção (decifra de vez)
+    pinlock-helper repair            # conserta pastas deixadas abertas (ex.: após queda)
+"""
+import fcntl
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HIDDEN_SUFFIX = ".pinlock"
+MIN_PIN_LEN = 4
+IDLE_TIMEOUT = os.environ.get("PINLOCK_IDLE", "15m")  # auto-bloqueio por inatividade
+SCRYPT_LOGN = os.environ.get("PINLOCK_SCRYPTN", "18")  # deixa cada tentativa de PIN lenta
+GOCRYPTFS = os.environ.get("PINLOCK_GOCRYPTFS") or shutil.which("gocryptfs") or "gocryptfs"
+XRAY = os.path.join(os.path.dirname(GOCRYPTFS), "gocryptfs-xray")
+FUSERMOUNT = shutil.which("fusermount3") or shutil.which("fusermount") or "fusermount"
+DATA_DIR = os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "pinlock"
+)
+ICON_FILE = os.path.join(DATA_DIR, "folder-locked.svg")
+OPEN_REGISTRY = os.path.join(DATA_DIR, "open")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+TITLE = "PinLock"
+EXIT_WRONG_PASSWORD = 12
+WRONG_PIN = "PIN incorreto."
+
+
+class PinLockError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- caminhos e estados
+
+def _norm(path):
+    return os.path.abspath(path).rstrip("/")
+
+
+def hidden_for(path):
+    """Fotos -> .Fotos.pinlock (cofre renomeado enquanto desbloqueada)."""
+    d, n = os.path.split(_norm(path))
+    return os.path.join(d, "." + n + HIDDEN_SUFFIX)
+
+
+def is_internal_name(path):
+    n = os.path.basename(_norm(path))
+    return n.startswith(".") and (n.endswith(HIDDEN_SUFFIX) or ".pinlock-" in n)
+
+
+def is_cipher_dir(path):
+    return os.path.isfile(os.path.join(path, "gocryptfs.conf")) and os.path.isfile(
+        os.path.join(path, "gocryptfs.diriv")
+    )
+
+
+def state(path):
+    """'locked' | 'unlocked' | 'stale' | None (pasta comum)."""
+    path = _norm(path)
+    if os.path.ismount(path):
+        return "unlocked" if is_cipher_dir(hidden_for(path)) else None
+    if is_cipher_dir(hidden_for(path)):
+        return "stale"  # cofre oculto, mas nada montado (desmontou e não voltou o nome)
+    if os.path.isdir(path) and is_cipher_dir(path):
+        return "locked"
+    return None
+
+
+def valid_pin(pin):
+    return bool(re.fullmatch(r"\d{%d,}" % MIN_PIN_LEN, pin or ""))
+
+
+class _vault_lock:
+    """Evita que duas operações (ex.: bloquear + vigia) mexam na mesma pasta juntas."""
+
+    def __init__(self, path):
+        h = hashlib.sha1(_norm(path).encode()).hexdigest()[:16]
+        self.file = os.path.join(RUNTIME_DIR, f"pinlock-{h}.lock")
+
+    def __enter__(self):
+        self.fd = os.open(self.file, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+
+    def __exit__(self, *exc):
+        os.close(self.fd)
+
+
+# ---------------------------------------------------------------- baixo nível
+
+def _gocryptfs(args, pin):
+    try:
+        return subprocess.run(
+            [GOCRYPTFS, "-q", *args], input=pin + "\n", text=True, capture_output=True
+        )
+    except FileNotFoundError:
+        raise PinLockError("gocryptfs não está instalado.\nInstale com: sudo apt install gocryptfs")
+
+
+def _check_pin(cipher, pin):
+    """Valida o PIN sem montar nada (evita renomear a pasta à toa)."""
+    if not os.access(XRAY, os.X_OK):
+        return  # sem xray: a montagem fará a checagem
+    r = subprocess.run(
+        [XRAY, "-dumpmasterkey", os.path.join(cipher, "gocryptfs.conf")],
+        input=pin + "\n", text=True, capture_output=True,
+    )
+    if r.returncode != 0:
+        raise PinLockError(WRONG_PIN)
+
+
+def _mount(cipher, mountpoint, pin, extra=()):
+    r = _gocryptfs([*extra, cipher, mountpoint], pin)
+    if r.returncode == EXIT_WRONG_PASSWORD:
+        raise PinLockError(WRONG_PIN)
+    if r.returncode != 0:
+        raise PinLockError("Falha ao montar:\n" + (r.stderr or r.stdout).strip())
+
+
+def _unmount(mountpoint):
+    r = subprocess.run([FUSERMOUNT, "-u", mountpoint], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise PinLockError(
+            "Não foi possível bloquear a pasta (algum arquivo ainda está aberto?).\n\n"
+            + r.stderr.strip()
+        )
+
+
+def _copy_tree(src, dst):
+    r = subprocess.run(["cp", "-a", "--", src.rstrip("/") + "/.", dst], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise PinLockError("Falha ao copiar arquivos:\n" + r.stderr.strip())
+    r = subprocess.run(["diff", "-rq", "--no-dereference", src, dst], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise PinLockError("A verificação da cópia falhou:\n" + (r.stdout + r.stderr).strip()[:2000])
+
+
+def _move(src, dst):
+    """Renomeia via GIO (leva junto os metadados do Nautilus, como o ícone)."""
+    if subprocess.run(["gio", "move", "-T", src, dst], capture_output=True).returncode != 0:
+        os.rename(src, dst)
+
+
+def _set_icon(path, locked):
+    if locked and os.path.isfile(ICON_FILE):
+        args = ["gio", "set", path, "metadata::custom-icon", "file://" + ICON_FILE]
+    else:
+        args = ["gio", "set", "-t", "unset", path, "metadata::custom-icon"]
+    subprocess.run(args, capture_output=True)
+
+
+def _tmp_mountpoint():
+    return tempfile.mkdtemp(prefix="pinlock-", dir=RUNTIME_DIR)
+
+
+def _rmtree(path):
+    os.chmod(path, 0o700)
+    shutil.rmtree(path)
+
+
+def _registry(add=None, remove=None):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        with open(OPEN_REGISTRY) as f:
+            items = [l.rstrip("\n") for l in f if l.strip()]
+    except FileNotFoundError:
+        items = []
+    if add and add not in items:
+        items.append(add)
+    if remove:
+        items = [i for i in items if i != remove]
+    if add or remove:
+        with open(OPEN_REGISTRY, "w") as f:
+            f.write("".join(i + "\n" for i in items))
+    return items
+
+
+def _seal(cipher, final_path):
+    """Dá ao cofre a aparência de 'pasta bloqueada' e o põe no nome final."""
+    # .hidden faz o Nautilus esconder os arquivos cifrados: a pasta aparece vazia.
+    names = sorted(n for n in os.listdir(cipher) if n != ".hidden")
+    with open(os.path.join(cipher, ".hidden"), "w") as f:
+        f.write("".join(n + "\n" for n in names))
+    _set_icon(cipher, locked=True)
+    _move(cipher, final_path)
+    os.chmod(final_path, 0o500)  # impede criar arquivos na pasta bloqueada
+
+
+# ---------------------------------------------------------------- operações
+
+def protect(path, pin):
+    path = _norm(path)
+    if not os.path.isdir(path) or os.path.islink(path):
+        raise PinLockError("Selecione uma pasta comum.")
+    if state(path) is not None:
+        raise PinLockError("Essa pasta já está protegida.")
+    if os.path.ismount(path) or is_internal_name(path):
+        raise PinLockError("Essa pasta não pode ser protegida.")
+    if os.path.realpath(path) in {"/", os.path.realpath(os.path.expanduser("~"))}:
+        raise PinLockError("Por segurança, essa pasta não pode ser protegida.")
+    if not valid_pin(pin):
+        raise PinLockError(f"O PIN deve ter pelo menos {MIN_PIN_LEN} dígitos numéricos.")
+
+    d, n = os.path.split(path)
+    new = os.path.join(d, f".{n}.pinlock-new")
+    if os.path.exists(new):
+        shutil.rmtree(new)
+    os.mkdir(new, 0o700)
+    mnt = None
+    try:
+        r = _gocryptfs(["-init", "-scryptn", SCRYPT_LOGN, new], pin)
+        if r.returncode != 0:
+            raise PinLockError("Falha ao criar o cofre:\n" + (r.stderr or r.stdout).strip())
+        mnt = _tmp_mountpoint()
+        _mount(new, mnt, pin)
+        try:
+            _copy_tree(path, mnt)
+        finally:
+            _unmount(mnt)
+    except BaseException:
+        if mnt and os.path.ismount(mnt):
+            subprocess.run([FUSERMOUNT, "-u", "-z", mnt])
+        shutil.rmtree(new, ignore_errors=True)
+        raise
+    finally:
+        if mnt and not os.path.ismount(mnt):
+            os.rmdir(mnt)
+
+    # Cópia verificada: troca o original pelo cofre, com o mesmo nome.
+    shutil.rmtree(path)
+    _seal(new, path)
+    return path
+
+
+def unlock(path, pin):
+    path = _norm(path)
+    hidden = hidden_for(path)
+    with _vault_lock(path):
+        st = state(path)
+        if st == "unlocked":
+            return path
+        if st is None:
+            raise PinLockError("Essa pasta não está protegida pelo PinLock.")
+        if os.path.exists(hidden) and st == "locked":
+            raise PinLockError(f"Já existe '{os.path.basename(hidden)}'. Remova-o antes.")
+
+        _check_pin(path if st == "locked" else hidden, pin)
+
+        if st == "locked":
+            os.chmod(path, 0o700)
+            try:
+                os.unlink(os.path.join(path, ".hidden"))
+            except FileNotFoundError:
+                pass
+            _move(path, hidden)
+            _set_icon(path, locked=False)
+            os.mkdir(path, 0o700)
+        else:  # stale
+            if not os.path.exists(path):
+                os.mkdir(path, 0o700)
+            elif not os.path.isdir(path) or os.listdir(path):
+                raise PinLockError(f"'{os.path.basename(path)}' não está vazia; mova o conteúdo antes.")
+
+        try:
+            _mount(hidden, path, pin, extra=["-i", IDLE_TIMEOUT])
+        except BaseException:
+            _finalize(path)
+            raise
+        _registry(add=path)
+    _spawn_watcher(path)
+    return path
+
+
+def _finalize(path):
+    """Desmonta (se preciso) e devolve o cofre ao nome original. Chamar sob _vault_lock."""
+    hidden = hidden_for(path)
+    if os.path.ismount(path):
+        _unmount(path)
+    if is_cipher_dir(hidden):
+        if os.path.exists(path):
+            if os.path.isdir(path) and not os.listdir(path):
+                os.rmdir(path)
+            else:
+                raise PinLockError(
+                    f"'{os.path.basename(path)}' recebeu arquivos depois de bloqueada.\n"
+                    f"Mova-os para outro lugar e tente bloquear de novo."
+                )
+        _seal(hidden, path)
+    _registry(remove=path)
+
+
+def lock(path):
+    path = _norm(path)
+    with _vault_lock(path):
+        if state(path) in ("unlocked", "stale"):
+            _finalize(path)
+
+
+def remove(path, pin):
+    path = _norm(path)
+    lock(path)
+    with _vault_lock(path):
+        if state(path) != "locked":
+            raise PinLockError("Essa pasta não está protegida pelo PinLock.")
+        _check_pin(path, pin)
+        d, n = os.path.split(path)
+        plain = os.path.join(d, f".{n}.pinlock-plain")
+        if os.path.exists(plain):
+            shutil.rmtree(plain)
+        mnt = _tmp_mountpoint()
+        try:
+            _mount(path, mnt, pin, extra=["-ro"])
+            try:
+                os.mkdir(plain, 0o700)
+                try:
+                    _copy_tree(mnt, plain)
+                except BaseException:
+                    shutil.rmtree(plain, ignore_errors=True)
+                    raise
+            finally:
+                _unmount(mnt)
+        finally:
+            if not os.path.ismount(mnt):
+                os.rmdir(mnt)
+        _rmtree(path)
+        _move(plain, path)
+        _set_icon(path, locked=False)
+    return path
+
+
+def repair():
+    """Fecha cofres que ficaram com nome oculto (ex.: sessão encerrada desbloqueada)."""
+    for path in _registry():
+        try:
+            with _vault_lock(path):
+                if state(path) == "stale":
+                    _finalize(path)
+                elif state(path) != "unlocked":
+                    _registry(remove=path)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# --------------------------------------------- vigia: auto-bloqueio por inatividade
+
+def _spawn_watcher(path):
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_watch", path],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _watch(path):
+    time.sleep(1)
+    while os.path.ismount(path):
+        time.sleep(2)
+    try:
+        with _vault_lock(path):
+            if state(path) == "stale":
+                _finalize(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# ---------------------------------------------------------------- interface (zenity)
+
+def _zenity(*args):
+    return subprocess.run(["zenity", f"--title={TITLE}", *args], capture_output=True, text=True)
+
+
+def ui_error(msg):
+    _zenity("--error", "--no-markup", f"--text={msg}")
+
+
+def ui_info(msg):
+    _zenity("--info", "--no-markup", f"--text={msg}")
+
+
+def ui_question(msg):
+    return _zenity("--question", "--no-markup", f"--text={msg}").returncode == 0
+
+
+def ui_pin(prompt):
+    r = _zenity("--entry", "--hide-text", "--no-markup", f"--text={prompt}")
+    return r.stdout.rstrip("\n") if r.returncode == 0 else None
+
+
+def ui_new_pin():
+    while True:
+        pin = ui_pin(f"Digite o novo PIN (mínimo {MIN_PIN_LEN} dígitos, recomendado 6+):")
+        if pin is None:
+            return None
+        if not valid_pin(pin):
+            ui_error(f"O PIN deve conter apenas números e ter pelo menos {MIN_PIN_LEN} dígitos.")
+            continue
+        again = ui_pin("Confirme o PIN:")
+        if again is None:
+            return None
+        if again != pin:
+            ui_error("Os PINs não conferem. Tente novamente.")
+            continue
+        return pin
+
+
+class ui_busy:
+    def __init__(self, text):
+        self.text = text
+
+    def __enter__(self):
+        self.p = subprocess.Popen(
+            ["zenity", f"--title={TITLE}", "--progress", "--pulsate", "--no-cancel",
+             "--auto-close", f"--text={self.text}"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.p.stdin.close()
+            self.p.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _open(path):
+    subprocess.Popen(["gio", "open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def ui_main(action, path):
+    name = os.path.basename(_norm(path))
+    if action == "protect":
+        if not ui_question(
+            f"Proteger '{name}' com PIN?\n\n"
+            "O conteúdo será cifrado e a pasta continuará com o mesmo nome.\n"
+            "Se você esquecer o PIN, NÃO há como recuperar os arquivos."
+        ):
+            return
+        pin = ui_new_pin()
+        if pin is None:
+            return
+        with ui_busy(f"Cifrando '{name}'…"):
+            protect(path, pin)
+        ui_info(f"'{name}' agora está protegida.\nClique com o botão direito > 'Desbloquear com PIN…' para abrir.")
+
+    elif action == "unlock":
+        while True:
+            pin = ui_pin(f"PIN de '{name}':")
+            if pin is None:
+                return
+            try:
+                with ui_busy("Verificando PIN…"):
+                    unlock(path, pin)
+            except PinLockError as e:
+                if str(e) == WRONG_PIN:
+                    ui_error(WRONG_PIN)
+                    continue
+                raise
+            _open(path)
+            return
+
+    elif action == "lock":
+        lock(path)
+
+    elif action == "remove":
+        if not ui_question(
+            f"Remover a proteção de '{name}'?\n\nOs arquivos voltarão a ficar sem criptografia."
+        ):
+            return
+        while True:
+            pin = ui_pin(f"PIN de '{name}':")
+            if pin is None:
+                return
+            try:
+                with ui_busy("Decifrando arquivos…"):
+                    remove(path, pin)
+            except PinLockError as e:
+                if str(e) == WRONG_PIN:
+                    ui_error(WRONG_PIN)
+                    continue
+                raise
+            return
+    else:
+        raise PinLockError(f"Ação desconhecida: {action}")
+
+
+def main(argv):
+    if len(argv) == 2 and argv[1] == "repair":
+        repair()
+        return 0
+    if len(argv) != 3:
+        print(__doc__, file=sys.stderr)
+        return 2
+    action, path = argv[1], argv[2]
+    if action == "_watch":
+        _watch(path)
+        return 0
+    try:
+        ui_main(action, path)
+    except PinLockError as e:
+        ui_error(str(e))
+        return 1
+    except Exception as e:  # noqa: BLE001
+        ui_error(f"Erro inesperado: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
