@@ -132,9 +132,42 @@ def _mount(cipher, mountpoint, pin, extra=()):
         raise PinLockError("Falha ao montar:\n" + (r.stderr or r.stdout).strip())
 
 
+def _holders(mountpoint):
+    """Programas com arquivos/pastas abertos dentro do ponto de montagem."""
+    root = os.path.realpath(mountpoint).rstrip("/") + "/"
+    found = {}
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        base = f"/proc/{pid}"
+        try:
+            links = [os.path.join(base, "fd", f) for f in os.listdir(base + "/fd")]
+        except OSError:
+            continue
+        links += [base + "/cwd", base + "/root"]
+        for link in links:
+            try:
+                target = os.readlink(link)
+            except OSError:
+                continue
+            if (target + "/").startswith(root):
+                try:
+                    with open(base + "/comm") as f:
+                        found[int(pid)] = f.read().strip()
+                except OSError:
+                    found[int(pid)] = "?"
+                break
+    return found
+
+
 def _unmount(mountpoint):
     r = subprocess.run([FUSERMOUNT, "-u", mountpoint], capture_output=True, text=True)
     if r.returncode != 0:
+        holders = _holders(mountpoint)
+        if holders:
+            who = "\n".join(f"• {name} (PID {pid})" for pid, name in sorted(holders.items()))
+            raise PinLockError(
+                "Não foi possível bloquear a pasta: ela está em uso por:\n\n"
+                + who + "\n\nFeche esses programas e tente de novo."
+            )
         raise PinLockError(
             "Não foi possível bloquear a pasta (algum arquivo ainda está aberto?).\n\n"
             + r.stderr.strip()
@@ -329,6 +362,11 @@ def remove(path, pin):
                 os.mkdir(plain, 0o700)
                 try:
                     _copy_tree(mnt, plain)
+                    # cp -a copia o modo da raiz do cofre (0500, somente leitura);
+                    # devolve permissões normais para a pasta poder ser movida/editada.
+                    umask = os.umask(0)
+                    os.umask(umask)
+                    os.chmod(plain, 0o777 & ~umask)
                 except BaseException:
                     shutil.rmtree(plain, ignore_errors=True)
                     raise
